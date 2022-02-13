@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from enum import Enum, IntEnum, unique
 from json import dumps as json_dumps
 from json import loads as json_loads
+from os import name as os_name
 from typing import Dict, List
 
 from attr import define
@@ -103,7 +104,9 @@ def everythings(
         )
     )
     dts = datetimes(
-        min_value=datetime(1904, 1, 1),
+        min_value=(
+            datetime(1970, 1, 1) if os_name == "nt" else datetime(1904, 1, 1)
+        ),
         max_value=datetime(2038, 1, 1),
         timezones=just(timezone.utc),
     )
