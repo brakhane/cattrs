@@ -1,7 +1,7 @@
 from __future__ import annotations
 import enum
 
-from typing import Literal
+from typing import Literal, Union, get_args
 import attrs
 import cattrs
 
@@ -29,7 +29,7 @@ class C:
 
 @attrs.define
 class D:
-    type: Literal[2]
+    type: Literal[3]
     subtype: Literal[2]
 
 @attrs.define
@@ -44,21 +44,28 @@ class E:
 class E2:
     also_no_type: str
 
+
 @attrs.define
 class F:
     subtype: Literal[3]
 
-print(cattrs.disambiguators.create_literal_field_dis_func(A, A2, B, C, D, DFafa, E, E2, F))
 
+
+#cattrs.disambiguators.create_literal_field_dis_func(A, A2, B, C, D, DFafa, E, E2, F, short_circuit=True)
+
+
+class Op(int, enum.Enum):
+    READY = 1
+    STEADY = 2
 
 @attrs.define
 class Ready:
-    op: Literal[1]
+    op: Literal[Op.READY]
     t: Literal[None]
 
 @attrs.define
 class Steady:
-    op: Literal[2]
+    op: Literal[Op.STEADY]
 
 @attrs.define
 class Go:
@@ -85,19 +92,20 @@ class DBaz(Dispatch):
 class DBazMember(DBaz):
     member: str
 
-cattrs.disambiguators.create_literal_field_dis_func(Steady, DFoo, DBar, DBaz, DBazMember)
+
+
+d = cattrs.disambiguators.create_literal_field_dis_func(Ready, Steady, Go, DFoo, DBar, DBaz, DBazMember, short_circuit=True)
+#d = cattrs.disambiguators.create_literal_field_dis_func(DFoo, DBar, DBaz, DBazMember, short_circuit=True)
+
+T = Union[Ready, Steady, Go, DFoo, DBar, DBaz, DBazMember]
+
+#conv = cattrs.disambiguators.create_literal_field_dis_func(*get_args(T))
+
+#cattrs.register_structure_hook(T, lambda obj,_: conv(obj) )
+
+
+print(cattrs.structure({"op": 1, "t_": None, "m_ember": "foo"}, T))
 
 
 
 
-
-class EE(enum.Enum):
-    A = object()
-    AA= "a"
-    B = "b"
-
-@attrs.define
-class Foo:
-    a: EE
-
-print(cattrs.structure({"a": "a"}, Foo))

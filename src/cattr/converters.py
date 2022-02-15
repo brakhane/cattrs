@@ -36,7 +36,7 @@ from ._compat import (
     is_tuple,
     is_union_type,
 )
-from .disambiguators import create_uniq_field_dis_func
+from .disambiguators import create_uniq_field_dis_func, create_literal_field_dis_func
 from .dispatch import MultiStrategyDispatch
 from .errors import StructureHandlerNotFoundError
 from .gen import (
@@ -575,7 +575,7 @@ class Converter(object):
                 "currently. Register a loads hook manually.",
                 type_=union,
             )
-        return create_uniq_field_dis_func(*union_types)
+        return create_literal_field_dis_func(*union_types, short_circuit=False) #create_uniq_field_dis_func(*union_types)
 
 
 class GenConverter(Converter):
