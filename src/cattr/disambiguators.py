@@ -1,16 +1,24 @@
 """Utilities for union (sum type) disambiguation."""
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from functools import reduce
+from itertools import product
 from operator import or_
 from typing import (  # noqa: F401, imported for Mypy.
+    Any,
     Callable,
     Dict,
+    Literal,
     Mapping,
     Optional,
+    Set,
+    Tuple,
     Type,
+    Union,
+    cast,
+    get_args,
 )
 
-from attr import NOTHING, fields
+from attr import NOTHING, fields, resolve_types
 
 from cattr._compat import get_origin
 
@@ -63,3 +71,126 @@ def create_uniq_field_dis_func(*classes: Type) -> Callable:
         return fallback
 
     return dis_func
+
+
+def _is_literal_type(t: Type) -> bool:
+    return get_origin(t) is Literal
+
+def _get_literal_args(t: Type[Any]) -> Tuple[Any]:
+    return get_args(t)
+
+
+class AnythingType():
+    def __repr__(self):
+        return "<anything>"
+
+Anything = AnythingType()
+
+def create_literal_field_dis_func(*classes: Type) -> Callable:
+    if len(classes) < 2:
+        raise ValueError("At least two classes required.")
+
+
+    litfields: Dict[str, Dict[Any, Set[Type]]] = defaultdict(lambda: defaultdict(set[Type]))
+
+
+    # First, find all fields that are defined as Literal in at least one class
+
+    for cls in classes:
+        resolve_types(cls) # returns immediately if already resolved, so not much overhead if not needed
+        for field in fields(get_origin(cls) or cls):
+            if _is_literal_type(field.type):
+                for value in _get_literal_args(cast(Type[Any], field.type)):
+                    litfields[field.name][value].add(cls)
+
+    best_fields = list(litfields.keys())
+    best_fields.sort(key=lambda k: len(litfields[k]), reverse=True)
+
+    print("best", best_fields)
+
+    # Now we need to check if some classes do not define a Literal for a specific field, in which
+    # case they always match. Note that "not defining a Literal" can mean not defining the field
+    # at all, or defining it as some arbitrary type.
+
+    for name, valuemap in litfields.copy().items():
+        wild_classes = set(classes)
+        for clss in valuemap.values():
+            for cls in clss:
+                wild_classes.discard(cls)
+        if wild_classes:
+            for clss in valuemap.values():
+                clss.update(wild_classes)
+            litfields[name][Anything] = wild_classes.copy()
+        else:
+            break
+
+
+
+    import graphviz
+    dot = graphviz.Digraph(strict="true")
+
+    dot.attr("node", shape="box")
+    dot.attr("graph", ranksep="1.5", searchsize="500", mclimit="10", newrank="true", concentrate="true")
+    #dot.attr("graph", splines="ortho")
+
+
+
+
+    def fmt(x):
+        nonlocal classes
+
+        #return '\n'.join(sorted(cls.__name__ for cls in x))
+        return "<" + '<br/>'.join(f"<font color='gray'>{cls.__name__}</font>" if cls not in x else cls.__name__ for cls in sorted(classes, key=lambda x:x.__name__)) + ">"
+
+    idxhack = []
+
+    def mktree(fns: list[str], classes: set[Type]):
+        dot.node(str(idxhack), label=fmt(classes))
+        if not fns:
+            return classes
+
+            if len(classes) > 1:
+                return create_uniq_field_dis_func(*classes)
+            else:
+                return next(iter(classes))
+        else:
+            tree = {}
+            for val, classes_ in litfields[fns[0]].items():
+                idxhack.append(val)
+                union = classes_ & classes
+
+
+                short_circuit = True
+
+                if short_circuit:
+                    if len(union) > 1:
+                        tree[val] = mktree(fns[1:], union)
+                    else:
+                        tree[val] = union
+                        dot.node(str(idxhack), label=fmt(union))
+                else:
+                    if union:
+                        tree[val] = mktree(fns[1:], union)
+
+                idxhack.pop()
+                if union:
+                    dot.edge(str(idxhack), str(idxhack+[val]), label=f'{fns[0]}\n{val}')
+            return tree
+
+
+
+
+
+
+
+    from pprint import pprint
+    mktree(best_fields, set(classes))
+    pprint(litfields)
+
+    dot.view()
+
+
+    #pprint(litfields)
+
+
+
