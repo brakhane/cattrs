@@ -4,6 +4,7 @@ from enum import Enum
 from functools import reduce, cache
 from operator import or_
 from typing import (  # noqa: F401, imported for Mypy.
+    Annotated,
     Any,
     Callable,
     Dict,
@@ -13,15 +14,14 @@ from typing import (  # noqa: F401, imported for Mypy.
     Set,
     Tuple,
     Type,
-    Union,
     cast,
+    get_type_hints,
 )
 
-from attr import NOTHING, fields, resolve_types, define
+from attr import NOTHING, fields, has, resolve_types
 
-from cattr._compat import get_origin, get_args
+from cattr._compat import get_origin, get_args, is_annotated, is_literal
 
-from pprint import pprint
 
 def create_uniq_field_dis_func(*classes: Type) -> Callable:
     """Given attr classes, generate a disambiguation function.
@@ -70,197 +70,191 @@ def create_uniq_field_dis_func(*classes: Type) -> Callable:
                 return v
         return fallback
 
-    dis_func.__qualname__ = f"create_uniq_field_dis_func.<generated>.dis_{'_'.join(cls.__qualname__ for cls in classes)}"
+    # dis_func.__qualname__ = f"create_uniq_field_dis_func.<generated>.dis_{'_'.join(cls.__qualname__ for cls in classes)}"
 
     return dis_func
 
-
-def _is_literal_type(t: Type) -> bool:
-    return get_origin(t) is Literal
-
-
-def _get_literal_args(t: Type[Any]) -> Tuple[Any]:
-    return get_args(t)
 
 
 class _AnythingType:
     def __repr__(self):
         return "<anything>"
 
-Anything = _AnythingType()
 
+# Internal marker standing for "field can have any value, including
+# being absent"
+_ANYTHING = _AnythingType()
 
-def _enum_value(x: Any) -> Any:
-    return x.value if isinstance(x, Enum) else x
+Fallback = object()
+
 
 
 def create_literal_field_dis_func(
-    *classes: Type, short_circuit=True
-) -> Callable:
+    *classes: Type, minimize_checks=True
+) -> Type:
     if len(classes) < 2:
         raise ValueError("At least two classes required.")
 
-    litfields: Dict[str, Dict[Any, Set[Type]]] = defaultdict(
+    disfields: Dict[str, Dict[Any, Set[Type]]] = defaultdict(
         lambda: defaultdict(set[Type])
     )
 
-    # First, find all fields that are defined as Literal in at least one class
+    fallback_only: Dict[str, Set[Type]] = defaultdict(set)
+
+    # First, find all fields that can be used for disambiguation
+    # These are either user defined via FIXME
+    # or, in "auto mode", are fields defined as Literal in at least one class
 
     for cls in classes:
-        resolve_types(
-            cls
-        )  # returns immediately if already resolved, so not much overhead if not needed
-        for field in fields(get_origin(cls) or cls):
-            if _is_literal_type(field.type):
-                for value in _get_literal_args(cast(Type[Any], field.type)):
-                    litfields[field.name][_enum_value(value)].add(cls)
+        disam_config = getattr(cls, "__test__", None)
+        if disam_config:
+            for k, v in disam_config.items():
+                disfields[k][v].add(cls)
+        else:
+            hints = get_type_hints(get_origin(cls) or cls, include_extras=True)
+            for name, typ in hints.items():
+                if is_annotated(typ):
+                    typ, *metadata = get_args(typ)
+                    if any(md is Fallback for md in metadata):
+                        fallback_only[name].add(cls)
 
-    # Now we need to check if some classes do not define a Literal for a specific field, in which
-    # case they always match. Note that "not defining a Literal" can mean not defining the field
-    # at all, or defining it as some arbitrary type.
+                if is_literal(typ):
+                    for value in get_args(typ):
+                        disfields[name][
+                            value.value if isinstance(value, Enum) else value
+                        ].add(cls)
 
-    for name, valuemap in litfields.copy().items():
+    if not disfields:
+        raise ValueError(f"No disambiguation fields found in any of the classes {classes}")
+
+    # Now we need to check if some classes do not define a disambiguation value
+    # for a specific field, in which case they always match.
+    # Note that "not defining a value" can mean not defining the field at all,
+    # or defining it as some arbitrary type.
+
+    for name, valuemap in disfields.copy().items():
         wild_classes = set(classes)
         for clss in valuemap.values():
             for cls in clss:
                 wild_classes.discard(cls)
         if wild_classes:
             for clss in valuemap.values():
-                clss.update(wild_classes)
-            litfields[name][Anything] = wild_classes
+                clss.update(wild_classes - fallback_only[name])
+            disfields[name][_ANYTHING] = wild_classes
 
-    best_fields = list(litfields.keys())
-    print(litfields)
-    if short_circuit:
-        # best_fields.sort(key=lambda k: len(litfields[k]), reverse=True)
-        best_fields.sort(
-            key=lambda k: sum(len(v) ** 2 for v in litfields[k].values()),
+    # if there is more than one literal fields, we might be able
+    # to reduce the number of checks by checking the fields
+    # that disambiguate the most.
+    # The heuristic to go by sum([number of classes per value]^2) seems
+    # to be a relatively good one based on my experiments.
+    #
+    # If we are checking every field value anyway, we don't need
+    # to find an "optimal" order, and we just go with defintion order
+
+    best_field_names = list(disfields.keys())
+    if minimize_checks:
+        best_field_names.sort(
+            key=lambda k: sum(len(v) ** 2 for v in disfields[k].values()),
             reverse=False,
         )
-
-    print("lit")
-    pprint(litfields)
-    print("best", best_fields)
-
-    import graphviz
-
-    dot = graphviz.Digraph(strict=False)
-
-    dot.attr("node", shape="box")
-    for a in ["node", "edge"]:
-        dot.attr(a, fontname="Fira Code")
-    dot.attr(
-        "graph",
-        ranksep="1.5",
-        searchsize="500",
-        mclimit="10",
-        newrank="true",
-        concentrate="true",
-    )
-    # dot.attr("graph", splines="ortho")
-
-    def fmt(x):
-        nonlocal classes
-
-        # return '\n'.join(sorted(cls.__name__ for cls in x))
-        return (
-            "<"
-            + '<br/>'.join(
-                f"<font color='gray'>{cls.__name__}</font>"
-                if cls not in x
-                else cls.__name__
-                for cls in sorted(classes, key=lambda x: x.__name__)
-            )
-            + ">"
-        )
-
-    idxhack = []
 
     cached_create_uniq_field_dis_func = cache(create_uniq_field_dis_func)
 
     class DisambiguationError(RuntimeError):
+        """
+        Internal exception raised by mktree to signify an error
+        and collect status information as it bubbles up the
+        stack.
+
+        args are original_exception, set_of_classes,
+        [(fieldname, fieldvalue) for each frame]
+        """
+
         pass
 
-    def mktree(fns: list[str], classes: set[Type]):
+    def mktree(names: list[str], classes: set[Type]):
         if not classes:
             return None
-        dot.node(str(idxhack), label=fmt(classes))
-        if len(classes) == 1 and short_circuit:
+        if len(classes) == 1 and minimize_checks:
             return next(iter(classes))
 
-        if not fns:
+        if not names:
             if len(classes) > 1:
                 try:
                     return cached_create_uniq_field_dis_func(*classes)
                 except ValueError as e:
-                    raise DisambiguationError(e, classes)
+                    raise DisambiguationError(e, classes) from None
             else:
                 return next(iter(classes))
         else:
             tree = {}
-            fn, *tail = fns
-            for val, classes_ in litfields[fn].items():
-                idxhack.append(val)
+            name, *tail = names
+            for val, classes_ in disfields[name].items():
                 union = classes_ & classes
 
                 try:
-                    if not short_circuit:
+                    if not minimize_checks:
                         tree[val] = mktree(tail, union)
                     else:
                         if union:
                             tree[val] = mktree(tail, union)
                 except DisambiguationError as e:
-                    raise DisambiguationError(*e.args, (fn, repr(val)))
+                    raise DisambiguationError(
+                        *e.args, (name, val)
+                    ) from None
 
-                idxhack.pop()
-                if union:
-                    dot.edge(
-                        str(idxhack),
-                        str(idxhack + [val]),
-                        label=fr"{fn}\n{val}",
-                    )
             return tree
 
     try:
-        tree = mktree(best_fields, set(classes))
+        tree = mktree(best_field_names, set(classes))
     except DisambiguationError as e:
+        # convert the internal exception into a ValueError with
+        # useful error message
         orig_e, classes, *params = e.args
-        params_str = ", ".join(f"{k}={v}" for k, v in params)
+        params_str = ", ".join(f"{k!r}={v!r}" for k, v in params)
         raise ValueError(
-            f"Unable to disambiguate between classes {classes} when {params_str}: {orig_e.args[0]}"
+            f"Unable to disambiguate between classes {classes} when "
+            f"{params_str}: {orig_e.args[0]}"
         ) from orig_e
-
-
-    pprint(tree)
-    dot.view()
 
     def dis_func(data: Mapping) -> Optional[Type]:
         if not isinstance(data, Mapping):
             raise ValueError("Only input mappings are supported.")
 
+        class NotFound(RuntimeError):
+            pass
+
         def recurse(i, tree):
             try:
-                fn = best_fields[i]
+                fn = best_field_names[i]
             except IndexError:
-                return None
-            val = data.get(fn, Anything)
+                raise NotFound()
+            val = data.get(fn, _ANYTHING)
             try:
                 subtree = tree[val]
             except KeyError:
                 try:
-                    subtree = tree[Anything]
+                    subtree = tree[_ANYTHING]
                 except KeyError:
-                    # No valid match found
-                    return None
-            if isinstance(
-                subtree, type
-            ):  # FIXME: is this always true, even for classes with custom metaclasses?
+                    if val is _ANYTHING:
+                        raise NotFound(f"{fn!r} is missing")
+                    else:
+                        raise NotFound(f"{fn!r}={val!r}")
+            if isinstance(subtree, type):
                 return subtree
             elif isinstance(subtree, Callable):
                 return subtree(data)
             else:
-                return recurse(i + 1, subtree)
+                try:
+                    return recurse(i + 1, subtree)
+                except NotFound as e:
+                    raise NotFound(f"{fn!r}={val!r}", *e.args)
 
-        return recurse(0, tree)
+        try:
+            return recurse(0, tree)
+        except NotFound as e:
+            raise ValueError(f"No class matches {', '.join(e.args)}") from None
+
+    # dis_func.__qualname__ = f"create_literal_field_dis_func.<generated>.dis_{'_'.join(cls.__qualname__ for cls in classes)}"
 
     return dis_func

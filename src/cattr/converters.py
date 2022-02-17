@@ -3,7 +3,7 @@ from collections.abc import MutableSet as AbcMutableSet
 from dataclasses import Field
 from enum import Enum
 from functools import lru_cache
-from typing import Any, Callable, Dict, Optional, Tuple, Type, TypeVar, Union
+from typing import Any, Callable, Dict, Optional, Tuple, Type, TypeVar, Union, get_args, get_type_hints
 
 from attr import Attribute
 from attr import has as attrs_has
@@ -36,7 +36,10 @@ from ._compat import (
     is_tuple,
     is_union_type,
 )
-from .disambiguators import create_uniq_field_dis_func, create_literal_field_dis_func
+from .disambiguators import (
+    create_uniq_field_dis_func,
+    create_literal_field_dis_func,
+)
 from .dispatch import MultiStrategyDispatch
 from .errors import StructureHandlerNotFoundError
 from .gen import (
@@ -65,6 +68,19 @@ def _subclass(typ):
     """a shortcut"""
     return lambda cls: issubclass(cls, typ)
 
+
+def is_disam_class(typ):
+    return (
+        isinstance(typ, type) and (
+            getattr(typ, "__test__", None) is not None or
+            any(is_literal(t) for t in get_type_hints(typ).values())
+        )
+    )
+
+def is_union_with_disam_class(typ):
+    return is_union_type(typ) and any(
+        is_disam_class(get_origin(e) or e) for e in typ.__args__
+    )
 
 def is_attrs_union(typ):
     return is_union_type(typ) and all(
@@ -280,8 +296,8 @@ class Converter(object):
 
     def register_structure_hook_factory(
         self,
-        predicate: Callable[[Any], bool],
-        factory: Callable[[Any], Callable[[Any], Any]],
+        predicate: Callable[[Type[T]], bool],
+        factory: Callable[[Type[T]], Callable[[Any, Type[T]], T]],
     ) -> None:
         """
         Register a hook factory for a given predicate.
@@ -405,9 +421,13 @@ class Converter(object):
 
     @staticmethod
     def _structure_literal(val, type):
-        if val not in type.__args__:
-            raise Exception(f"{val} not in literal {type}")
-        return val
+        vals = {
+            (x.value if isinstance(x, Enum) else x): x for x in type.__args__
+        }
+        try:
+            return vals[val]
+        except KeyError:
+            raise Exception(f"{val} not in literal {type}") from None
 
     # Attrs classes.
 
@@ -575,7 +595,8 @@ class Converter(object):
                 "currently. Register a loads hook manually.",
                 type_=union,
             )
-        return create_literal_field_dis_func(*union_types, short_circuit=False) #create_uniq_field_dis_func(*union_types)
+        return create_uniq_field_dis_func(*union_types)
+        # return create_literal_field_dis_func(*union_types, minimize_checks=True)
 
 
 class GenConverter(Converter):
