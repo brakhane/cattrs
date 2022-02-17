@@ -14,13 +14,21 @@ from typing import (  # noqa: F401, imported for Mypy.
     Set,
     Tuple,
     Type,
+    Union,
     cast,
     get_type_hints,
+    TYPE_CHECKING,
 )
 
 from attr import NOTHING, fields, has, resolve_types
 
 from cattr._compat import get_origin, get_args, is_annotated, is_literal
+
+from cattr.errors import StructureHandlerNotFoundError
+
+
+if TYPE_CHECKING:
+    from cattr.converters import Converter
 
 
 def create_uniq_field_dis_func(*classes: Type) -> Callable:
@@ -88,12 +96,18 @@ _ANYTHING = _AnythingType()
 Fallback = object()
 
 
+class FOO(RuntimeError): pass
 
-def create_literal_field_dis_func(
-    *classes: Type, minimize_checks=True
-) -> Type:
+HACK = []
+
+def create_literal_field_dis_structure_func(
+    union: Type, converter: 'Converter', minimize_checks=True
+):
+    classes = get_args(union)
+
     if len(classes) < 2:
-        raise ValueError("At least two classes required.")
+        raise ValueError("A union cannot have a single type")
+
 
     disfields: Dict[str, Dict[Any, Set[Type]]] = defaultdict(
         lambda: defaultdict(set[Type])
@@ -158,8 +172,6 @@ def create_literal_field_dis_func(
             reverse=False,
         )
 
-    cached_create_uniq_field_dis_func = cache(create_uniq_field_dis_func)
-
     class DisambiguationError(RuntimeError):
         """
         Internal exception raised by mktree to signify an error
@@ -173,19 +185,28 @@ def create_literal_field_dis_func(
         pass
 
     def mktree(names: list[str], classes: set[Type]):
+        global HACK
+
         if not classes:
             return None
-        if len(classes) == 1 and minimize_checks:
-            return next(iter(classes))
 
-        if not names:
-            if len(classes) > 1:
-                try:
-                    return cached_create_uniq_field_dis_func(*classes)
-                except ValueError as e:
-                    raise DisambiguationError(e, classes) from None
-            else:
-                return next(iter(classes))
+
+        if (len(classes) == 1 and minimize_checks) or (not names):
+            HACK.append(None)
+            try:
+                it = iter(classes)
+                t = next(it)
+                for cl in it:
+                    t = Union[t, cl]
+                func = converter._structure_func.dispatch(t)
+                if func == converter._structure_error:
+                    raise RuntimeError("No structure hook for this type exists.")
+                return func
+            except Exception as e:
+                raise DisambiguationError(e, classes) from None
+            finally:
+                HACK.pop()
+
         else:
             tree = {}
             name, *tail = names
@@ -205,6 +226,7 @@ def create_literal_field_dis_func(
 
             return tree
 
+
     try:
         tree = mktree(best_field_names, set(classes))
     except DisambiguationError as e:
@@ -212,12 +234,23 @@ def create_literal_field_dis_func(
         # useful error message
         orig_e, classes, *params = e.args
         params_str = ", ".join(f"{k!r}={v!r}" for k, v in params)
-        raise ValueError(
-            f"Unable to disambiguate between classes {classes} when "
-            f"{params_str}: {orig_e.args[0]}"
-        ) from orig_e
 
-    def dis_func(data: Mapping) -> Optional[Type]:
+        if len(classes) > 1:
+            error_msg = (
+                f"Unable to disambiguate between types {classes} when "
+                f"{params_str}: {orig_e.args[0]}\n"
+                f"Hint: register a structure hook for Union[{', '.join(cls.__name__ for cls in classes)}]."
+            )
+        else:
+            error_msg = (
+                f"Unable to structure type {next(iter(classes))} when "
+                f"{params_str}: {orig_e.args[0]}"
+            )
+
+
+        raise ValueError(error_msg) from orig_e
+
+    def dis_func(data: Mapping, typ: Type) -> Optional[Type]:
         if not isinstance(data, Mapping):
             raise ValueError("Only input mappings are supported.")
 
@@ -240,10 +273,11 @@ def create_literal_field_dis_func(
                         raise NotFound(f"{fn!r} is missing")
                     else:
                         raise NotFound(f"{fn!r}={val!r}")
-            if isinstance(subtree, type):
-                return subtree
-            elif isinstance(subtree, Callable):
-                return subtree(data)
+            if isinstance(subtree, Callable):
+                assert not isinstance(subtree, type)
+                xx=subtree(data, typ)
+                print(f"{subtree=} {data=} {xx=}")
+                return xx
             else:
                 try:
                     return recurse(i + 1, subtree)
