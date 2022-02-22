@@ -12,6 +12,14 @@ Subpackages
 Submodules
 ----------
 
+cattr.annotations module
+------------------------
+
+.. automodule:: cattr.annotations
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
 cattr.converters module
 -----------------------
 

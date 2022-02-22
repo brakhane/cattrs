@@ -228,8 +228,8 @@ Unions
 Unions of ``NoneType`` and a single other type are supported (also known as
 ``Optional`` s). All other unions a require a disambiguation function.
 
-Automatic Disambiguation
-""""""""""""""""""""""""
+Automatic Disambiguation via unique fields
+""""""""""""""""""""""""""""""""""""""""""
 
 In the case of a union consisting exclusively of ``attrs`` classes, ``cattrs``
 will attempt to generate a disambiguation function automatically; this will
@@ -257,6 +257,89 @@ succeed only if each class has a unique field. Given the following classes:
 of ``B`` will contain ``y``, etc. A disambiguation function using this
 information will then be generated and cached. This will happen automatically,
 the first time an appropriate union is structured.
+
+Automatic Disambiguation via discriminators
+"""""""""""""""""""""""""""""""""""""""""""
+
+``cattrs`` will also automatically create a disambiguation function if
+your classes contain discriminators marked via ``typing.Literal``. This
+does even work for non-``attrs`` classes:
+
+.. code-block:: python
+
+    >>> @define
+    ... class A:
+    ...     t: Literal[1]
+    ...     data: str
+    ...
+    >>> @define
+    ... class B:
+    ...     t: Literal[2, 4] # multiple values are also supported
+    ...     data: str
+    ...
+    >>> @dataclass # those work as well
+    ... class C:
+    ...     t: Literal[3]
+    ...     data: str
+    ...
+    >>> @define # it will even try other strategies to solve ambiguities
+    ... class AWithMoreData:
+    ...     t: Literal[1]
+    ...     data: str
+    ...     more_data: str
+
+``cattrs`` will know that instances of ``A`` have ``t`` set to 1, unless the data
+also contains a ``more_data`` key, in which case ``AWithMoreData`` will be
+used. ``B`` will be inferred if ``t`` is either 2 or 4.
+
+You can also use more than one discriminator:
+
+.. code-block:: python
+
+    >>> @define
+    ... class A:
+    ...     type: Literal[1]
+    ...     data: str
+    >>> @define
+    ... class A2:
+    ...     type: Literal[1]
+    ...     subtype: Literal[2]
+    ...     data: str
+    >>> @define
+    ... class A3:
+    ...     type: Literal[1]
+    ...     subtype: Literal[3]
+    ...     data: str
+    >>> @define
+    ... class B:
+    ...     type: Literal[2]
+    ...     data: str
+
+``{"type": 1, "subtype": 2, "data": "..."}`` would be structured into ``A2``.
+
+If you do not want to have the discriminators as members, you can in most cases
+use a decorator instead:
+
+.. code-block:: python
+
+    >>> @has_discriminator({"t": 1})
+    ... @define
+    ... class A:
+    ...     data: str
+    ...
+    >>> @has_discriminator({"t": 2, "st": 1})
+    ... @dataclass
+    ... class B:
+    ...     data: str
+    ...
+    >>> @has_discriminator({"t": 2, "st": 2})
+    ... @define
+    ... class C:
+    ...     data: str
+
+There's even more that ``cattrs`` can do (and a few things to be aware of),
+make sure to read `The automated way via discriminators`_  for more information.
+
 
 Manual Disambiguation
 """""""""""""""""""""

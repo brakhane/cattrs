@@ -1,5 +1,5 @@
 from functools import lru_cache, singledispatch
-from typing import Any, Callable, List, Tuple, Union
+from typing import Any, Callable, List, Set, Tuple, Union
 
 import attr
 
@@ -34,7 +34,7 @@ class MultiStrategyDispatch:
         self._single_dispatch = singledispatch(_DispatchNotFound)
         self.dispatch = lru_cache(maxsize=None)(self._dispatch)
 
-    def _dispatch(self, cl):
+    def _dispatch(self, cl, skip_handlers=frozenset()):
         try:
             dispatch = self._single_dispatch.dispatch(cl)
             if dispatch is not _DispatchNotFound:
@@ -46,7 +46,9 @@ class MultiStrategyDispatch:
         if direct_dispatch is not None:
             return direct_dispatch
 
-        return self._function_dispatch.dispatch(cl)
+        return self._function_dispatch.dispatch(
+            cl, skip_handlers=skip_handlers
+        )
 
     def register_cls_list(self, cls_and_handler, direct: bool = False):
         """register a class to direct or singledispatch"""
@@ -109,7 +111,7 @@ class FunctionDispatch:
     ):
         self._handler_pairs.insert(0, (can_handle, func, is_generator))
 
-    def dispatch(self, typ):
+    def dispatch(self, typ, *, skip_handlers=frozenset()):
         """
         returns the appropriate handler, for the object passed.
         """
@@ -121,7 +123,7 @@ class FunctionDispatch:
                 ch = can_handle(typ)
             except Exception:
                 continue
-            if ch:
+            if ch and handler not in skip_handlers:
                 if is_generator:
                     return handler(typ)
                 else:

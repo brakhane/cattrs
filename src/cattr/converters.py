@@ -1,9 +1,20 @@
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import MutableSet as AbcMutableSet
 from dataclasses import Field
 from enum import Enum
 from functools import lru_cache
-from typing import Any, Callable, Dict, Optional, Tuple, Type, TypeVar, Union, get_args, get_type_hints
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Optional,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+    get_args,
+    get_type_hints,
+)
 
 from attr import Attribute
 from attr import has as attrs_has
@@ -36,10 +47,11 @@ from ._compat import (
     is_tuple,
     is_union_type,
 )
+from .annotations import Fallback
 from .disambiguators import create_uniq_field_dis_func
 from .dispatch import MultiStrategyDispatch
 from .errors import StructureHandlerNotFoundError
-from .gen import (
+from cattrs.gen import (
     AttributeOverride,
     make_dict_structure_fn,
     make_dict_unstructure_fn,
@@ -66,18 +78,23 @@ def _subclass(typ):
     return lambda cls: issubclass(cls, typ)
 
 
-def is_disam_class(typ):
-    return (
-        isinstance(typ, type) and (
-            getattr(typ, "__test__", None) is not None or
-            any(is_literal(t) for t in get_type_hints(typ).values())
-        )
+def is_discriminated_class(typ):
+    return isinstance(typ, type) and hasattr(typ, "__cattr_discriminators__")
+
+
+def is_class_with_literal_types(typ):
+    return isinstance(typ, type) and any(
+        is_literal(t) for t in get_type_hints(typ).values()
     )
 
-def is_union_with_disam_class(typ):
+
+def is_union_with_some_discriminated_or_literal_classes(typ):
     return is_union_type(typ) and any(
-        is_disam_class(get_origin(e) or e) for e in typ.__args__
+        is_discriminated_class(get_origin(e) or e)
+        or is_class_with_literal_types(get_origin(e) or e)
+        for e in typ.__args__
     )
+
 
 def is_attrs_union(typ):
     return is_union_type(typ) and all(
@@ -99,6 +116,38 @@ def is_optional(typ):
     )
 
 
+class _DisambiguationError(RuntimeError):
+    """
+    Internal exception raised by
+    _literal_field_dis_structure_hook_factory.mktree to signify an error
+    and collect status information as it bubbles up the
+    stack.
+
+    args are original_exception, set_of_classes,
+    [(fieldname, fieldvalue) for each frame]
+    """
+
+
+class _NotFound(RuntimeError):
+    """
+    Internal exception raised by
+    _literal_field_dis_structure_hook_factory.struct_func.recurse to
+    collect parameter values as it bubbles up the stack.
+
+    args are strings of "key=value" form.
+    """
+
+
+class _AnythingType:
+    def __repr__(self):
+        return "<anything>"
+
+
+# Internal marker standing for "field can have any value, including
+# being absent"
+_ANYTHING = _AnythingType()
+
+
 class Converter(object):
     """Converts between structured and unstructured data."""
 
@@ -111,6 +160,8 @@ class Converter(object):
         "_union_struct_registry",
         "_structure_func",
         "_prefer_attrib_converters",
+        "_unstruct_strat",
+        "_minimize_union_discriminator_checks",
     )
 
     def __init__(
@@ -118,9 +169,13 @@ class Converter(object):
         dict_factory: Callable[[], Any] = dict,
         unstruct_strat: UnstructureStrategy = UnstructureStrategy.AS_DICT,
         prefer_attrib_converters: bool = False,
+        minimize_union_disambiguation_checks: bool = False,
     ) -> None:
         unstruct_strat = UnstructureStrategy(unstruct_strat)
         self._prefer_attrib_converters = prefer_attrib_converters
+        self._minimize_union_discriminator_checks = (
+            minimize_union_disambiguation_checks
+        )
 
         # Create a per-instance cache.
         if unstruct_strat is UnstructureStrategy.AS_DICT:
@@ -177,6 +232,11 @@ class Converter(object):
                 (
                     is_attrs_union_or_none,
                     self._gen_attrs_union_structure,
+                    True,
+                ),
+                (
+                    is_union_with_some_discriminated_or_literal_classes,
+                    self._discriminated_union_structure_hook_factory,
                     True,
                 ),
                 (
@@ -593,7 +653,255 @@ class Converter(object):
                 type_=union,
             )
         return create_uniq_field_dis_func(*union_types)
-        # return create_literal_field_dis_func(*union_types, minimize_checks=True)
+
+    def _discriminated_union_structure_hook_factory(
+        self, union_: Type[T]
+    ) -> Callable[[Any, T], T]:
+        classes = get_args(union_)
+
+        if len(classes) < 2:
+            raise ValueError("A union cannot have a single type")
+
+        # map from discriminator field name → (value → set of classes that match)
+        disfields: Dict[str, Dict[Any, MutableSet[Type]]] = defaultdict(
+            lambda: defaultdict(set[Type])
+        )
+
+        fallback_only: Dict[str, MutableSet[Type]] = defaultdict(set)
+
+        # First, find all fields that can be used for disambiguation
+        # These are either user defined via @has_discriminator
+        # or, in "auto mode", are fields defined as Literal in at least one
+        # class of the union
+
+        for cls in classes:
+            disam_config = getattr(cls, "__cattr_discriminators__", None)
+
+            if disam_config:
+                if self._unstructure_attrs == self.unstructure_attrs_astuple:
+                    raise ValueError(
+                        f"Cannot use @has_discriminator classes with "
+                        f"{UnstructureStrategy.AS_TUPLE}"
+                    )
+                for k, v in disam_config.items():
+                    disfields[k][v].add(cls)
+
+            else:
+                hints = get_type_hints(
+                    get_origin(cls) or cls, include_extras=True
+                )
+                for name, typ in hints.items():
+                    if is_annotated(typ):
+                        typ, *metadata = get_args(typ)
+                        if any(md is Fallback for md in metadata):
+                            fallback_only[name].add(cls)
+
+                    if is_literal(typ):
+                        for value in get_args(typ):
+                            disfields[name][
+                                value.value
+                                if isinstance(value, Enum)
+                                else value
+                            ].add(cls)
+
+        if not disfields:
+            # This shouldn't happen, as our handler will only be called
+            # when at least one disambiguation field exists
+            raise ValueError(
+                f"No disambiguation fields found in any of the classes {classes}"
+            )
+
+        # Now we need to check if some classes do not define a disambiguation
+        # value for a specific field, in which case they always match.
+        # Note that "not defining a value" can mean not defining the field at
+        # all, or defining it as some arbitrary type.
+
+        for name, valuemap in disfields.copy().items():
+            wild_classes = set(classes)
+            for clss in valuemap.values():
+                for cls in clss:
+                    wild_classes.discard(cls)
+            if wild_classes:
+                for clss in valuemap.values():
+                    clss.update(wild_classes - fallback_only[name])
+                disfields[name][_ANYTHING] = wild_classes
+
+        # if there is more than one disambiguation field, we might be able
+        # to reduce the number of checks by checking the fields
+        # that disambiguate the most.
+        # The heuristic to go by sum([number of classes per value]^2) seems
+        # to be a relatively good one based on my experiments.
+        #
+        # However, if we are going to check every field value anyway,
+        # we don't need to find an "optimal" order, and we just go with
+        # defintion order
+
+        best_field_names = list(disfields.keys())
+        if self._minimize_union_discriminator_checks:
+            best_field_names.sort(
+                key=lambda k: sum(len(v) ** 2 for v in disfields[k].values()),
+                reverse=False,
+            )
+
+        # Now we need to create the decision tree.
+        # The tree is stored as a dict, with the keys
+        # representing the "match value", and the value
+        # either being another map (for further checks),
+        # or a structuring hook.
+        #
+        # Example:
+        # Class A matches spam=1; B matches spam=2, eggs=1
+        # and both C and D match spam=2, eggs=2,
+        # and "best_fields" are ["spam", "eggs"], then the final tree will
+        # look something like this:
+        # {1: structure_A, 2: {1: structure_B, 2: structure_Union_CD}}
+        #
+        # Note that structure_Union_CD will be structuring the Union of C and D,
+        # and that the value of eggs is not checked in case spam=1.
+
+        def mktree(depth: int, classes: set[Type]):
+
+            # see below
+            skip_handlers = frozenset(
+                [
+                    self._discriminated_union_structure_hook_factory,
+                    self._structure_error,
+                ]
+            )
+
+            if not classes:
+                raise ValueError("called with empty classes")
+
+            if depth >= len(best_field_names) or (
+                self._minimize_union_discriminator_checks and len(classes) == 1
+            ):
+                # no more checks left, we now need to find
+                # a structure hook.
+                try:
+                    it = iter(classes)
+                    t = next(it)
+                    for cl in it:
+                        t = Union[t, cl]
+
+                    # if it's another Union, there's a good chance
+                    # we would be chosen as structuring hook, resulting
+                    # in endless recursion. We already know we cannot
+                    # distinguish between the remaining classes,
+                    # so we tell dispatch to ignore us.
+                    # We also want to immediately fail if there's no
+                    # match, so we also skip the "last resort"
+                    # handler which would raise an Exception later
+                    # when executed.
+                    func = self._structure_func.dispatch(
+                        t, skip_handlers=skip_handlers
+                    )
+                    num_annotated = sum(
+                        hasattr(cls, "__cattr_discriminators__")
+                        for cls in classes
+                    )
+                    if num_annotated:
+                        if num_annotated < len(classes):
+                            raise ValueError(
+                                "Cannot have ambiguity between classes that are "
+                                "annotated with has_discriminator and those "
+                                "that aren't."
+                            )
+
+                        def remove_discriminators_and_dispatch(obj):
+                            for name in best_field_names:
+                                obj.pop(name, None)
+                            return func(obj, t)
+
+                        return remove_discriminators_and_dispatch
+                    else:
+                        return lambda obj: func(obj, t)
+
+                except Exception as e:
+                    raise _DisambiguationError(e, classes) from None
+
+            else:
+                tree = {}
+                name = best_field_names[depth]
+                for val, classes_ in disfields[name].items():
+                    union = classes_ & classes
+                    try:
+                        if union:
+                            print(f"{union=} {name}={val!r}")
+                            tree[val] = mktree(depth + 1, union)
+                    except _DisambiguationError as e:
+                        raise _DisambiguationError(
+                            *e.args, (name, val)
+                        ) from None
+
+                return tree
+
+        try:
+            tree = mktree(0, set(classes))
+        except _DisambiguationError as e:
+            # convert the internal exception into a ValueError with
+            # a helpful error message
+            orig_e, classes, *params = e.args
+            params_str = ", ".join(f"{k!r}={v!r}" for k, v in params)
+
+            if len(classes) > 1:
+                error_msg = (
+                    f"Unable to disambiguate between types {classes} when "
+                    f"{params_str}: {orig_e.args[0]}\n"
+                    f"Hint: register a structure hook for "
+                    f"Union[{', '.join(cls.__name__ for cls in classes)}], "
+                    f"or mark one or more classes as a fallback."
+                )
+            else:
+                error_msg = (
+                    f"Unable to structure type {next(iter(classes))} when "
+                    f"{params_str}: {orig_e.args[0]}"
+                )
+
+            raise ValueError(error_msg) from orig_e
+
+        # now that the decision tree is build, we can create our
+        # structure function and return it. This will simply walk through the
+        # tree and execute the specific structure handler.
+        # If no handlers match the values, we raise an exception
+
+        def struct_func(data: Mapping, typ: Type) -> Optional[Type]:
+            if not isinstance(data, Mapping):
+                raise ValueError("Only input mappings are supported.")
+
+            def recurse(i, tree):
+                try:
+                    fn = best_field_names[i]
+                except IndexError:
+                    raise _NotFound()
+                val = data.get(fn, _ANYTHING)
+                try:
+                    subtree = tree[val]
+                except KeyError:
+                    try:
+                        subtree = tree[_ANYTHING]
+                    except KeyError:
+                        if val is _ANYTHING:
+                            raise _NotFound(f"{fn!r}=<missing>")
+                        else:
+                            raise _NotFound(f"{fn!r}={val!r}")
+                if isinstance(subtree, Callable):
+                    # structure handler, call it
+                    return subtree(data)
+                else:
+                    # another subtree
+                    try:
+                        return recurse(i + 1, subtree)
+                    except _NotFound as e:
+                        raise _NotFound(f"{fn!r}={val!r}", *e.args)
+
+            try:
+                return recurse(0, tree)
+            except _NotFound as e:
+                raise ValueError(
+                    f"No class matches {', '.join(e.args)}"
+                ) from None
+
+        return struct_func
 
 
 class GenConverter(Converter):
@@ -731,11 +1039,14 @@ class GenConverter(Converter):
         if attrs_has(cl) and any(isinstance(a.type, str) for a in attribs):
             # PEP 563 annotations - need to be resolved.
             resolve_types(cl)
-        attrib_overrides = {
-            a.name: self.type_overrides[a.type]
-            for a in attribs
-            if a.type in self.type_overrides
-        }
+
+        attrib_overrides = {}
+        for a in attribs:
+            v = self.type_overrides.get(a.type) or self.type_overrides.get(
+                get_origin(a.type)
+            )
+            if v:
+                attrib_overrides[a.name] = v
 
         h = make_dict_unstructure_fn(
             cl,
@@ -750,11 +1061,14 @@ class GenConverter(Converter):
         if attrs_has(cl) and any(isinstance(a.type, str) for a in attribs):
             # PEP 563 annotations - need to be resolved.
             resolve_types(cl)
-        attrib_overrides = {
-            a.name: self.type_overrides[a.type]
-            for a in attribs
-            if a.type in self.type_overrides
-        }
+
+        attrib_overrides = {}
+        for a in attribs:
+            v = self.type_overrides.get(a.type) or self.type_overrides.get(
+                get_origin(a.type)
+            )
+            if v:
+                attrib_overrides[a.name] = v
         h = make_dict_structure_fn(
             cl,
             self,
