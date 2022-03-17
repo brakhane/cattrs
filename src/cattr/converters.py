@@ -657,9 +657,9 @@ class Converter(object):
     def _discriminated_union_structure_hook_factory(
         self, union_: Type[T]
     ) -> Callable[[Any, T], T]:
-        classes = get_args(union_)
+        all_union_classes = get_args(union_)
 
-        if len(classes) < 2:
+        if len(all_union_classes) < 2:
             raise ValueError("A union cannot have a single type")
 
         # map from discriminator field name → (value → set of classes that match)
@@ -667,6 +667,8 @@ class Converter(object):
             lambda: defaultdict(set[Type])
         )
 
+        # fallback classes are marked with Annotated[..., Fallback]
+        # and will only match if there's no alternative
         fallback_only: Dict[str, MutableSet[Type]] = defaultdict(set)
 
         # First, find all fields that can be used for disambiguation
@@ -674,7 +676,7 @@ class Converter(object):
         # or, in "auto mode", are fields defined as Literal in at least one
         # class of the union
 
-        for cls in classes:
+        for cls in all_union_classes:
             disam_config = getattr(cls, "__cattr_discriminators__", None)
 
             if disam_config:
@@ -708,7 +710,7 @@ class Converter(object):
             # This shouldn't happen, as our handler will only be called
             # when at least one disambiguation field exists
             raise ValueError(
-                f"No disambiguation fields found in any of the classes {classes}"
+                f"No disambiguation fields found in any of the classes {all_union_classes}"
             )
 
         # Now we need to check if some classes do not define a disambiguation
@@ -717,7 +719,7 @@ class Converter(object):
         # all, or defining it as some arbitrary type.
 
         for name, valuemap in disfields.copy().items():
-            wild_classes = set(classes)
+            wild_classes = set(all_union_classes)
             for clss in valuemap.values():
                 for cls in clss:
                     wild_classes.discard(cls)
@@ -759,26 +761,30 @@ class Converter(object):
         # Note that structure_Union_CD will be structuring the Union of C and D,
         # and that the value of eggs is not checked in case spam=1.
 
-        def mktree(depth: int, classes: set[Type]):
+        def mktree(depth: int, remaining_classes: set[Type]):
 
             # see below
             skip_handlers = frozenset(
-                [
-                    self._discriminated_union_structure_hook_factory,
-                    self._structure_error,
-                ]
+                # [
+                #     self._discriminated_union_structure_hook_factory,
+                #     self._structure_error,
+                # ]
             )
 
-            if not classes:
+            if not remaining_classes:
                 raise ValueError("called with empty classes")
 
             if depth >= len(best_field_names) or (
-                self._minimize_union_discriminator_checks and len(classes) == 1
+                self._minimize_union_discriminator_checks and len(remaining_classes) == 1
             ):
                 # no more checks left, we now need to find
                 # a structure hook.
+
+                if len(remaining_classes) == len(all_union_classes):
+                    raise _DisambiguationError(ValueError(f"Every single class matches."), remaining_classes)
+
                 try:
-                    it = iter(classes)
+                    it = iter(remaining_classes)
                     t = next(it)
                     for cl in it:
                         t = Union[t, cl]
@@ -797,10 +803,10 @@ class Converter(object):
                     )
                     num_annotated = sum(
                         hasattr(cls, "__cattr_discriminators__")
-                        for cls in classes
+                        for cls in remaining_classes
                     )
                     if num_annotated:
-                        if num_annotated < len(classes):
+                        if num_annotated < len(remaining_classes):
                             raise ValueError(
                                 "Cannot have ambiguity between classes that are "
                                 "annotated with has_discriminator and those "
@@ -817,13 +823,13 @@ class Converter(object):
                         return lambda obj: func(obj, t)
 
                 except Exception as e:
-                    raise _DisambiguationError(e, classes) from None
+                    raise _DisambiguationError(e, remaining_classes) from None
 
             else:
                 tree = {}
                 name = best_field_names[depth]
-                for val, classes_ in disfields[name].items():
-                    union = classes_ & classes
+                for val, matching_classes in disfields[name].items():
+                    union = matching_classes & remaining_classes
                     try:
                         if union:
                             print(f"{union=} {name}={val!r}")
@@ -836,24 +842,24 @@ class Converter(object):
                 return tree
 
         try:
-            tree = mktree(0, set(classes))
+            tree = mktree(0, set(all_union_classes))
         except _DisambiguationError as e:
             # convert the internal exception into a ValueError with
             # a helpful error message
-            orig_e, classes, *params = e.args
+            orig_e, ambigious_classes, *params = e.args
             params_str = ", ".join(f"{k!r}={v!r}" for k, v in params)
 
-            if len(classes) > 1:
+            if len(ambigious_classes) > 1:
                 error_msg = (
-                    f"Unable to disambiguate between types {classes} when "
+                    f"Unable to disambiguate between types {ambigious_classes} when "
                     f"{params_str}: {orig_e.args[0]}\n"
                     f"Hint: register a structure hook for "
-                    f"Union[{', '.join(cls.__name__ for cls in classes)}], "
+                    f"Union[{', '.join(cls.__name__ for cls in ambigious_classes)}], "
                     f"or mark one or more classes as a fallback."
                 )
             else:
                 error_msg = (
-                    f"Unable to structure type {next(iter(classes))} when "
+                    f"Unable to structure type {next(iter(ambigious_classes))} when "
                     f"{params_str}: {orig_e.args[0]}"
                 )
 
